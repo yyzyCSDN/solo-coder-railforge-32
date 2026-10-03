@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, is_dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Mapping, TypeVar
 
@@ -21,6 +21,7 @@ from railforge.locomotive.tractive_effort import available_effort
 from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.routing.clearance import route_ok
+from railforge.signaling.block_occupancy import conflicts as block_conflicts
 from railforge.signaling.block_occupancy import reserve
 from railforge.storage.ops_store import VersionedStore
 from railforge.timetable.meets import conflicts as meet_conflicts
@@ -172,9 +173,16 @@ class RailForgeWorkflowControl:
         return self._commit(operation_id, "energy.calculated", subject, at,
                             lambda: net_energy(rows))
 
-    def lock_switch_route(self, operation_id, route, switches, owner, subject, at):
-        return self._commit(operation_id, "yard.route.locked", subject, at,
-                            lambda: lock_route(route, switches, owner))
+    def lock_switch_route(self, operation_id, route, switches, owner, subject, at,
+                          occupancy=None, occupancies=(), clearance=None):
+        def action():
+            if occupancy is not None:
+                hit = block_conflicts(occupancy, list(occupancies),
+                                      clearance if clearance is not None else timedelta(0))
+                if hit:
+                    raise ValueError("block conflict: " + ",".join(hit))
+            return lock_route(route, switches, owner)
+        return self._commit(operation_id, "yard.route.locked", subject, at, action)
 
     def check_clearance(self, operation_id, profile, segments, subject, at):
         return self._commit(operation_id, "routing.clearance.checked", subject, at,
@@ -187,6 +195,3 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
-
-
-BROKEN_CONTROL_TOPICS.add('yard.route.locked')

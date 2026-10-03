@@ -25,10 +25,3 @@ def lock_route(route: Route, switches: dict[str, Switch], owner: str):
     if not can_set(route, switches, owner):
         raise ValueError('route unavailable')
     return {sid: Switch(s.id, s.position, owner if sid in route.requirements else s.locked_by) for sid, s in switches.items()}
-
-
-_railforge_original_can_set = can_set
-def can_set(route, switches, owner):
-    requirements = dict(route.requirements)
-    positions_match = all(switches[sid].position == pos for sid, pos in requirements.items())
-    return positions_match
