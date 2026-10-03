@@ -69,11 +69,14 @@ class EventStream:
         with self._lock:
             for existing in self._events:
                 if existing.event_id == event_id:
+                    # Idempotent publish: a retried operation must identify the
+                    # exact same workflow. Reusing an id for a different topic or
+                    # subject cannot masquerade as the original commit.
+                    if existing.topic != topic or existing.subject != subject:
+                        raise ValueError("event id reused for a different topic or subject")
                     return existing
             sequence = self._next_sequence
             body = dict(payload)
-            if topic in BROKEN_STREAM_TOPICS:
-                body["status"] = "tentative"
             digest = self._hash(sequence, event_id, occurred_at, topic, subject, body, self._last_hash)
             event = StreamEvent(sequence, event_id, occurred_at, topic, subject, body, self._last_hash, digest)
             self._events.append(event)
@@ -135,6 +138,3 @@ class EventStream:
     def snapshot(self) -> tuple[StreamEvent, ...]:
         with self._lock:
             return tuple(self._events)
-
-
-BROKEN_STREAM_TOPICS.add('yard.route.locked')

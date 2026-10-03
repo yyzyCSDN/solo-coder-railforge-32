@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, is_dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from threading import RLock
 from typing import Any, Callable, Mapping, TypeVar
 
 from railforge.audit.trail import Trail
@@ -22,6 +23,7 @@ from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.routing.clearance import route_ok
 from railforge.signaling.block_occupancy import reserve
+from railforge.signaling.interlocking import Interlocking, RouteDemand
 from railforge.storage.ops_store import VersionedStore
 from railforge.timetable.meets import conflicts as meet_conflicts
 from railforge.wagon.axle_load import route_ok as axle_route_ok
@@ -56,6 +58,7 @@ class OperationReceipt:
     event: Any
     audit_index: int
     version: int
+    owner: str | None = None
 
 
 class RailForgeWorkflowControl:
@@ -68,6 +71,8 @@ class RailForgeWorkflowControl:
         self.store = store or VersionedStore()
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
+        self._interlockings: dict[str, Interlocking] = {}
+        self._interlocking_lock = RLock()
 
     @property
     def receipts(self) -> Mapping[str, OperationReceipt]:
@@ -79,8 +84,14 @@ class RailForgeWorkflowControl:
         if previous is not None:
             if previous.topic != topic or previous.subject != subject:
                 raise ValueError("operation id reused for a different workflow")
+            owner = (evidence or {}).get("owner")
+            if owner is not None and previous.owner is not None and owner != previous.owner:
+                # A retry must not let a different dispatcher claim ownership
+                # established by the original committed operation.
+                raise PermissionError("operation id already committed by another owner")
             return previous
         result = action()
+        owner = (evidence or {}).get("owner")
         version = self.store.write(subject, _safe(result))
         payload = {
             "operation_id": operation_id,
@@ -92,7 +103,8 @@ class RailForgeWorkflowControl:
         }
         event = self.stream.publish(operation_id, at, topic, subject, payload)
         audit = self.trail.append("railforge-control", topic, subject, at)
-        receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
+        receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index,
+                                   version, owner=owner)
         self._receipts[operation_id] = receipt
         return receipt
 
@@ -172,9 +184,54 @@ class RailForgeWorkflowControl:
         return self._commit(operation_id, "energy.calculated", subject, at,
                             lambda: net_energy(rows))
 
+    def provision_interlocking(self, territory, switches=None, occupancies=None):
+        """Register the authoritative interlocking aggregate for a territory."""
+        with self._interlocking_lock:
+            existing = self._interlockings.get(territory)
+            if existing is not None:
+                return existing
+            interlocking = Interlocking(switches, occupancies)
+            self._interlockings[territory] = interlocking
+            return interlocking
+
+    def interlocking(self, territory) -> Interlocking:
+        interlocking = self._interlockings.get(territory)
+        if interlocking is None:
+            raise ValueError(f"no interlocking provisioned for territory {territory}")
+        return interlocking
+
+    def set_switch_route(self, operation_id, territory, route_id, owner, at,
+                         requirements, occupancy=None, clearance=timedelta(0)):
+        """Set a route through the atomic control plane.
+
+        Switch lock ownership, route position requirements and block occupancy
+        are decided together against the interlocking's committed state, so a
+        retry cannot bypass ownership and a rejection leaves no partial locks.
+        """
+        interlocking = self.interlocking(territory)
+        demand = RouteDemand(operation_id, owner, dict(requirements), occupancy, clearance)
+
+        def action():
+            grant = interlocking.request(demand, route_id)
+            return {
+                "route_id": grant.route_id,
+                "owner": grant.owner,
+                "locked_switches": list(grant.locked_switches),
+                "switches": {sid: {"position": p.position, "locked_by": p.locked_by}
+                             for sid, p in grant.switches.items()},
+                "occupancies": [
+                    {"train": r.train, "block": r.block, "enter": r.enter,
+                     "exit": r.exit, "direction": r.direction}
+                    for r in grant.occupancies
+                ],
+            }
+        evidence = {"owner": owner, "territory": territory}
+        return self._commit(operation_id, "signaling.route.set", territory, at, action, evidence)
+
     def lock_switch_route(self, operation_id, route, switches, owner, subject, at):
         return self._commit(operation_id, "yard.route.locked", subject, at,
-                            lambda: lock_route(route, switches, owner))
+                            lambda: lock_route(route, switches, owner),
+                            {"owner": owner})
 
     def check_clearance(self, operation_id, profile, segments, subject, at):
         return self._commit(operation_id, "routing.clearance.checked", subject, at,
@@ -187,6 +244,3 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
-
-
-BROKEN_CONTROL_TOPICS.add('yard.route.locked')

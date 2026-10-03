@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 from railforge.cargo.segregation import violations
 from railforge.commercial.contract_capacity import allocate as allocate_capacity
 from railforge.control.recovery import choose as choose_recovery
@@ -55,6 +57,11 @@ class RailForgeFeatureService:
                 raise ValueError("axle limit: " + ",".join(rejected))
             return {"clear": True, "wagons": len(wagons)}
         return self.control.run(operation_id, "feature.route.clearance", operation_id, at, action)
+
+    def request_switch_route(self, operation_id, territory, route_id, owner, requirements, at,
+                             occupancy=None, clearance=timedelta(0)):
+        return self.control.set_switch_route(
+            operation_id, territory, route_id, owner, at, requirements, occupancy, clearance)
 
     def rebalance_yard(self, operation_id, cuts, tracks, occupied, route, switches, owner, at):
         def action():
